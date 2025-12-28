@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Channels Squelch Editor</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:20px}
+label{display:block;margin-top:8px}
+input,select{padding:6px;margin-top:4px;width:320px}
+textarea{width:640px;height:200px}
+.card{border:1px solid #ddd;padding:12px;margin-bottom:16px;border-radius:8px}
+pre{background:#f7f7f7;padding:8px}
+</style>
+</head>
+<body>
+<h1>Channels Squelch Editor</h1>
+<div>
+  <button id="load">Load</button>
+  <button id="save">Save</button>
+</div>
+<div id="list"></div>
+<pre id="preview"></pre>
+<script>
+let channels = {};
+const TYPES = ['NoTone','Tone','TSQL','DTCS','Cross'];
+function el(tag, props={}, children=[]) { const e = document.createElement(tag); Object.assign(e, props); children.forEach(c=> e.appendChild(c)); return e; }
+function field(labelText, input){ const w = el('div',{}); w.appendChild(el('label',{innerText:labelText})); w.appendChild(input); return w; }
+function render(){
+  const list = document.getElementById('list'); list.innerHTML='';
+  Object.keys(channels).sort().forEach(name=>{
+    const c = channels[name]; c.squelch = c.squelch || {type:'NoTone'};
+    const card = el('div',{className:'card'});
+    card.appendChild(el('h3',{innerText:`${name} — ${c.mhz.toFixed(6)} MHz`}));
+    const typeSel = el('select'); TYPES.forEach(t=>{ const opt = el('option',{value:t,innerText:t}); if((c.squelch.type||'NoTone')===t) opt.selected=true; typeSel.appendChild(opt); });
+    typeSel.onchange = ()=>{ c.squelch.type = typeSel.value; render(); };
+    card.appendChild(field('Squelch Type', typeSel));
+    if(['Tone','TSQL'].includes(c.squelch.type)){
+      const ct = el('input',{type:'number',step:'0.1',value:(c.squelch.ctcss_hz??'')}); ct.oninput = ()=>{ c.squelch.ctcss_hz = parseFloat(ct.value)||null; };
+      const notch = el('input',{type:'checkbox',checked:(c.squelch.ctcss_notch??false)}); notch.onchange = ()=>{ c.squelch.ctcss_notch = notch.checked; };
+      card.appendChild(field('CTCSS (Hz)', ct)); card.appendChild(field('CTCSS Notch', notch));
+    }
+    if(c.squelch.type==='DTCS'){
+      const code = el('input',{type:'number',step:'1',value:(c.squelch.dtcs_code??'')}); code.oninput = ()=>{ c.squelch.dtcs_code = parseInt(code.value)||null; };
+      const pol = el('select'); ['NN','NR','RN','RR'].forEach(p=>{ const o = el('option',{value:p,innerText:p}); if((c.squelch.dtcs_polarity||'')===p) o.selected=true; pol.appendChild(o); });
+      pol.onchange = ()=>{ c.squelch.dtcs_polarity = pol.value; };
+      const verify = el('input',{type:'checkbox',checked:(c.squelch.dtcs_verify??false)}); verify.onchange = ()=>{ c.squelch.dtcs_verify = verify.checked; };
+      card.appendChild(field('DTCS Code', code)); card.appendChild(field('DTCS Polarity', pol)); card.appendChild(field('Verify code/polarity (requires dcs_map.json)', verify));
+    }
+    if(c.squelch.type==='Cross'){
+      const rxct = el('input',{type:'number',step:'0.1',value:(c.squelch.rx?.ctcss_hz??'')}); rxct.oninput = ()=>{ c.squelch.rx = c.squelch.rx||{}; c.squelch.rx.ctcss_hz = parseFloat(rxct.value)||null; };
+      const rxdc = el('input',{type:'number',step:'1',value:(c.squelch.rx?.dtcs_code??'')}); rxdc.oninput = ()=>{ c.squelch.rx = c.squelch.rx||{}; c.squelch.rx.dtcs_code = parseInt(rxdc.value)||null; };
+      const txct = el('input',{type:'number',step:'0.1',value:(c.squelch.tx?.ctcss_hz??'')}); txct.oninput = ()=>{ c.squelch.tx = c.squelch.tx||{}; c.squelch.tx.ctcss_hz = parseFloat(txct.value)||null; };
+      const txdc = el('input',{type:'number',step:'1',value:(c.squelch.tx?.dtcs_code??'')}); txdc.oninput = ()=>{ c.squelch.tx = c.squelch.tx||{}; c.squelch.tx.dtcs_code = parseInt(txdc.value)||null; };
+      const txpol = el('select'); ['','NN','NR','RN','RR'].forEach(p=>{ const o = el('option',{value:p,innerText:p||'(none)'}); if((c.squelch.tx?.dtcs_polarity||'')===p) o.selected=true; txpol.appendChild(o); }); txpol.onchange = ()=>{ c.squelch.tx = c.squelch.tx||{}; c.squelch.tx.dtcs_polarity = txpol.value; };
+      const notch = el('input',{type:'checkbox',checked:(c.squelch.ctcss_notch??false)}); notch.onchange = ()=>{ c.squelch.ctcss_notch = notch.checked; };
+      const verify = el('input',{type:'checkbox',checked:(c.squelch.dtcs_verify??false)}); verify.onchange = ()=>{ c.squelch.dtcs_verify = verify.checked; };
+      card.appendChild(field('RX CTCSS (Hz)', rxct)); card.appendChild(field('RX DTCS Code', rxdc)); card.appendChild(field('TX CTCSS (Hz)', txct)); card.appendChild(field('TX DTCS Code', txdc)); card.appendChild(field('TX DTCS Polarity', txpol)); card.appendChild(field('CTCSS Notch', notch)); card.appendChild(field('Verify RX DTCS (requires dcs_map.json)', verify));
+    }
+    card.appendChild(el('pre',{innerText: JSON.stringify(c, null, 2)}));
+    document.getElementById('list').appendChild(card);
+  });
+  document.getElementById('preview').innerText = JSON.stringify(channels, null, 2);
+}
+async function load(){ try{ const r = await fetch('/api/channels'); channels = await r.json(); render(); }catch(e){ alert('Failed to load /api/channels.'); } }
+async function save(){ try{ const r = await fetch('/api/channels/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(channels)}); const t = await r.text(); alert(t); }catch(e){ alert('Failed to save: ' + e); } }
+document.getElementById('load').onclick = load; document.getElementById('save').onclick = save;
+</script>
+</body>
+</html>

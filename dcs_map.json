@@ -1,0 +1,10 @@
+{
+  "README": "Pre-seeded DTCS keys from your channels. Values are empty arrays. Use dcs_learn.py to populate signatures.",
+  "116:NN": [],
+  "152:NN": [],
+  "205:NN": [],
+  "23:NN": [],
+  "261:NN": [],
+  "331:NN": [],
+  "411:NN": []
+}
