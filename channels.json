@@ -1,21 +1,26 @@
 {
-  "Nav Fire": {
-    "mhz": 154.1075,
-    "ctcss_hz": 100.0,
-    "ctcss_notch": true
-  },
-  "Nav Med": {
-    "mhz": 154.235,
-    "ctcss_hz": 151.4
-  },
-  "Cor Fire": {
-    "mhz": 154.34,
-    "ctcss_hz": 192.8
-  },
-  "VFire22": {
-    "mhz": 154.265
-  },
-  "NOAA6": {
-    "mhz": 162.525
-  }
+  "NavFire": 154.1075,
+  "NavMed": 154.235,
+  "NavEOC": 158.8275,
+  "NavFG1": 155.4,
+  "NavFG2": 155.295,
+  "VFire21": 154.28,
+  "VFire22": 154.265,
+  "VFire23": 154.295,
+  "VFire24": 154.2725,
+  "VFire25": 154.2875,
+  "VFire26": 154.3025,
+  "VMed28": 155.34,
+  "VMed29": 155.3475,
+  "CorMed": 155.175,
+  "CorFire": 154.34,
+  "NavSO1": 155.1,
+  "NavSO2": 155.6025,
+  "BGISD1": 461.025,
+  "BGISD2": 461.025,
+  "BGISD3": 466.025,
+  "BGFirstBaptist1": 152.27,
+  "BGFirstBaptist2": 152.27,
+  "BGFirstBaptist3": 157.53,
+  "NOAA6": 162.525
 }
