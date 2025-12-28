@@ -1,0 +1,21 @@
+{
+  "Nav Fire": {
+    "mhz": 154.1075,
+    "ctcss_hz": 100.0,
+    "ctcss_notch": true
+  },
+  "Nav Med": {
+    "mhz": 154.235,
+    "ctcss_hz": 151.4
+  },
+  "Cor Fire": {
+    "mhz": 154.34,
+    "ctcss_hz": 192.8
+  },
+  "VFire22": {
+    "mhz": 154.265
+  },
+  "NOAA6": {
+    "mhz": 162.525
+  }
+}

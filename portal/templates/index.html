@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SDR Bot Portal</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<header>
+  <h1>SDR Bot Management Portal</h1>
+  <div class="cfg">Guild: {{ ps.get('guild_name') }} · Voice: {{ ps.get('channel_name') or 'n/a' }} · Channels loaded: {{ ps.get('channels_loaded') }} | <a href="/logout">Log out</a></div>
+</header>
+<section class="grid">
+  <div class="card">
+    <h2>Health</h2>
+    <ul>
+      <li><strong>FFmpeg:</strong> {{ '✅' if ff['present'] else '❌' }} <code>{{ ff['path'] }}</code><pre>{{ ff['info'] }}</pre></li>
+      <li><strong>rtl_fm:</strong> {{ '✅' if rf.get('present', False) else '❌' }}<pre>{{ rf.get('info','') }}</pre></li>
+      <li><strong>discord.py:</strong> {{ py['discord_py_version'] }} · PyNaCl: {{ '✅' if py['pynacl'] else '❌' }} · Opus: {{ '✅' if py['opus_loaded'] else '❌' }}</li>
+      <li><strong>Intents:</strong> message_content={{ it['message_content'] }} voice_states={{ it['voice_states'] }}</li>
+      <li><strong>Status:</strong> connected={{ ps['connected'] }} playing={{ ps['playing'] }} latency={{ ps['latency'] }}</li>
+    </ul>
+    <button onclick="api('/api/health')">Refresh</button>
+  </div>
+  <div class="card">
+    <h2>Voice Control</h2>
+    <button onclick="api('/api/join', 'POST')">Join</button>
+    <button onclick="api('/api/leave', 'POST')">Leave</button>
+    <div class="row">
+      <form onsubmit="return tuneByName(event)">
+        <label>Channel name</label>
+        <input name="name" list="chlist" placeholder="Nav Fire" />
+        <datalist id="chlist">
+          {% for name, entry in channels.items() %}
+          <option value="{{ name }}">{{ entry.mhz }}</option>
+          {% endfor %}
+        </datalist>
+        <button type="submit">Tune</button>
+      </form>
+    </div>
+    <div class="row">
+      <form onsubmit="return tuneByMhz(event)">
+        <label>MHz</label>
+        <input name="mhz" type="number" step="0.000001" placeholder="154.265" />
+        <button type="submit">Tune</button>
+      </form>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Channels.json</h2>
+    <p>Path: <code>{{ cfg.get('CHANNELS_JSON') or 'channels.json' }}</code></p>
+    <div id="channels">
+      <table>
+        <thead><tr><th>Name</th><th>MHz</th><th>CTCSS (Hz)</th><th>Notch</th></tr></thead>
+        <tbody>
+          {% for name, entry in channels.items() %}
+          <tr><td>{{ name }}</td><td>{{ entry.mhz }}</td><td>{{ entry.ctcss_hz or '' }}</td><td>{{ entry.ctcss_notch }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <h3>Add / Replace</h3>
+    <form onsubmit="return addChannel(event)">
+      <input name="name" placeholder="New Name" required />
+      <input name="mhz" type="number" step="0.000001" placeholder="154.265" required />
+      <input name="ctcss_hz" type="number" step="0.1" placeholder="192.8" />
+      <label><input type="checkbox" name="ctcss_notch" /> notch</label>
+      <button type="submit">Append</button>
+    </form>
+    <button onclick="reloadChannels()">Reload</button>
+    <details>
+      <summary>Bulk replace (JSON)</summary>
+      <textarea id="bulk" rows="8" placeholder='{"Nav Fire":{"mhz":154.265,"ctcss_hz":192.8,"ctcss_notch":true}}'></textarea>
+      <button onclick="bulkReplace()">Replace</button>
+    </details>
+  </div>
+  <div class="card">
+    <h2>Settings</h2>
+    <form onsubmit="return applySettings(event)">
+      <div class="grid2">
+        <div><label>Gain dB</label><input name="gain" type="number" /></div>
+        <div><label>Squelch</label><input name="squelch" type="number" /></div>
+        <div><label>Bandwidth (Hz)</label><input name="bandwidth" type="number" /></div>
+        <div><label>Oversampling</label><input name="oversampling" type="number" /></div>
+        <div><label>PPM</label><input name="ppm" type="number" /></div>
+        <div><label>Center offset (kHz)</label><input name="center_offset_khz" type="number" step="0.1" /></div>
+        <div><label>atan</label><input name="atan" placeholder="std|fast|lut" /></div>
+        <div><label>Stereo</label><select name="stereo"><option value="">(no change)</option><option value="true">on</option><option value="false">off</option></select></div>
+        <div><label>Clean</label><select name="clean"><option value="">(no change)</option><option value="true">on</option><option value="false">off</option></select></div>
+        <div><label>DC block</label><select name="dc"><option value="">(no change)</option><option value="true">on</option><option value="false">off</option></select></div>
+        <div><label>FIR size</label><select name="fir"><option value="">(no change)</option><option>0</option><option>9</option></select></div>
+      </div>
+      <button type="submit">Apply</button>
+    </form>
+  </div>
+</section>
+<script>
+const API_KEY_PRESENT = {{ 'true' if has_api_key else 'false' }};
+function authInit(opts){ opts = opts || {}; opts.headers = opts.headers || {}; return opts; }
+function api(path, method){ method = method || 'GET'; return fetch(path, authInit({method})).then(r => r.json()).then(j => { alert(JSON.stringify(j,null,2)); return j; }); }
+async function tuneByName(ev){ ev.preventDefault(); const fd = new FormData(ev.target); const r = await fetch('/api/tune', authInit({method:'POST', body:fd})); alert(await r.text()); }
+async function tuneByMhz(ev){ ev.preventDefault(); const fd = new FormData(ev.target); const r = await fetch('/api/tune', authInit({method:'POST', body:fd})); alert(await r.text()); }
+async function addChannel(ev){ ev.preventDefault(); const fd = new FormData(ev.target); if(fd.get('ctcss_notch')==='on'){ fd.set('ctcss_notch','true'); } const r = await fetch('/api/channels/append', authInit({method:'POST', body:fd})); alert(await r.text()); }
+async function reloadChannels(){ const r = await fetch('/api/channels/reload', authInit({method:'POST'})); alert(await r.text()); }
+async function bulkReplace(){ const txt = document.getElementById('bulk').value; try{ JSON.parse(txt); }catch(e){ alert('Invalid JSON'); return; } const r = await fetch('/api/channels', authInit({method:'PUT', body: txt, headers: {'Content-Type':'application/json'}})); alert(await r.text()); }
+async function applySettings(ev){ ev.preventDefault(); const fd = new FormData(ev.target); for(const k of ['stereo','clean','dc']){ const v = fd.get(k); if(v==='true') fd.set(k, 'true'); else if(v==='false') fd.set(k, 'false'); else fd.delete(k);} const r = await fetch('/api/settings', authInit({method:'POST', body:fd})); alert(await r.text()); }
+</script>
+</body>
+</html>

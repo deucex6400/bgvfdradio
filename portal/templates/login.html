@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Portal Login</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>.login-card{max-width:360px;margin:10vh auto}.error{color:#ff7b7b;margin-top:.5rem}</style>
+</head>
+<body>
+  <div class="card login-card">
+    <h2>SDR Bot Portal Login</h2>
+    <form method="post" action="/login">
+      <label>Username</label>
+      <input name="username" placeholder="admin" required />
+      <label>Password</label>
+      <input name="password" type="password" placeholder="3400" required />
+      <button type="submit">Login</button>
+    </form>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  </div>
+</body>
+</html>
