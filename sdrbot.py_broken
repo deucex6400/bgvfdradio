@@ -1,0 +1,419 @@
+# -*- coding: utf-8 -*-
+import os, sys, asyncio, signal, subprocess, shutil, json, math
+from dataclasses import dataclass, asdict
+from collections import deque
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+# ------------------ Config ------------------
+def parse_cfg():
+    cfg = {}
+    raw = os.getenv('DISCORD_CFG', '')
+    if raw:
+        try:
+            j = raw.strip()
+            if (j.startswith('"') and j.endswith('"')) or (j.startswith("'") and j.endswith("'")):
+                j = j[1:-1]
+            j2 = j.replace("'", '"')
+            cfg = json.loads(j2)
+        except Exception:
+            cfg = {}
+    token = os.getenv('DISCORD_TOKEN', cfg.get('token', ''))
+    gid = os.getenv('GUILD_ID', str(cfg.get('guildId', '')))
+    vid = os.getenv('VOICE_CHANNEL_ID', str(cfg.get('voiceChannelId', '')))
+    pfx = os.getenv('COMMAND_PREFIX', cfg.get('prefix', '!'))
+    out = {'token': token, 'prefix': pfx}
+    try:
+        if gid: out['guildId'] = int(gid)
+    except Exception: pass
+    try:
+        if vid: out['voiceChannelId'] = int(vid)
+    except Exception: pass
+    return out
+
+CFG = parse_cfg()
+
+DEFAULT_FFMPEG = 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg'
+DEFAULT_RTLFM  = 'rtl_fm.exe' if os.name == 'nt' else 'rtl_fm'
+FFMPEG_EXE     = os.getenv('FFMPEG_EXE', DEFAULT_FFMPEG)
+RTL_FM_EXE     = os.getenv('RTL_FM_EXE', DEFAULT_RTLFM)
+CHANNELS_JSON  = os.getenv('CHANNELS_JSON', 'channels.json')
+RTL_DEVICE_INDEX = os.getenv('RTL_DEVICE_INDEX')
+CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+CHANNEL_META = {}
+
+# Optional DTCS mapping file (learned signatures)
+DTCS_MAP_PATH = os.getenv('DTCS_MAP', 'dcs_map.json')
+DTCS_MAP = {}
+if os.path.isfile(DTCS_MAP_PATH):
+    try:
+        with open(DTCS_MAP_PATH, 'r') as f:
+            DTCS_MAP = json.load(f)
+    except Exception:
+        DTCS_MAP = {}
+
+
+def load_channels(path: str) -> dict:
+    global CHANNEL_META
+    CHANNEL_META = {}
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+        out = {}
+        for name, val in data.items():
+            if isinstance(val, dict):
+                mhz = float(val.get('mhz'))
+                out[name] = int(round(mhz * 1_000_000))
+                meta = {}
+                squ = val.get('squelch') or {}
+                if squ.get('type'):
+                    meta['type'] = str(squ['type'])
+                if squ.get('ctcss_hz') is not None:
+                    meta['ctcss_hz'] = float(squ['ctcss_hz'])
+                if squ.get('ctcss_notch') is not None:
+                    meta['ctcss_notch'] = bool(squ['ctcss_notch'])
+                if squ.get('dtcs_code') is not None:
+                    meta['dtcs_code'] = int(squ['dtcs_code'])
+                if squ.get('dtcs_polarity') is not None:
+                    meta['dtcs_polarity'] = str(squ['dtcs_polarity'])
+                if squ.get('rx'):
+                    meta['rx'] = squ['rx']
+                    if isinstance(squ['rx'], dict) and squ['rx'].get('ctcss_hz') is not None:
+                        meta['ctcss_hz'] = float(squ['rx']['ctcss_hz'])
+                        if meta.get('ctcss_notch') is None:
+                            meta['ctcss_notch'] = True
+                    if isinstance(squ['rx'], dict) and squ['rx'].get('dtcs_code') is not None:
+                        meta['rx_dtcs_code'] = int(squ['rx']['dtcs_code'])
+                        meta['rx_dtcs_polarity'] = str(squ['rx'].get('dtcs_polarity',''))
+                if squ.get('tx'):
+                    meta['tx'] = squ['tx']
+                # Verification toggle
+                meta['dtcs_verify'] = bool(squ.get('dtcs_verify', False))
+                CHANNEL_META[name] = meta
+            else:
+                out[name] = int(round(float(val) * 1_000_000))
+        return out
+    except Exception:
+        return {}
+
+CHANNELS = load_channels(CHANNELS_JSON)
+
+@dataclass
+class SDRSettings:
+    gain_db: int = 35
+    squelch: int = 1
+    samplerate: int = 12000
+    oversampling: int = 4
+    ppm: int = 0
+    atan_mode: str = 'fast'
+    deemp: bool = True
+    offset_tuning: bool = False
+    dc_block: bool = False
+    fir_size: int = 0
+    center_offset_hz: int = 0
+    output_stereo: bool = True
+    output_clean: bool = True
+
+SETTINGS = SDRSettings()
+SAMPLES_PER_20MS = 960
+
+# ------------------ Detectors ------------------
+class CTCSSDetector:
+    def __init__(self, target_hz: float, sample_rate: int = 48000,
+                 window_ms: int = 300, power_ratio_db: float = 12.0):
+        self.target_hz = float(target_hz)
+        self.fs = int(sample_rate)
+        self.N = int(self.fs * (window_ms / 1000.0))
+        self.buf = deque(maxlen=self.N)
+        k = int(0.5 + (self.N * self.target_hz / self.fs))
+        self._omega = (2.0 * math.pi * k) / self.N
+        self._coeff = 2.0 * math.cos(self._omega)
+        self._ratio_db = float(power_ratio_db)
+    def add_frame(self, stereo_s16le: bytes):
+        import struct
+        for L, R in struct.iter_unpack('<hh', stereo_s16le):
+            self.buf.append(0.5 * (L + R))
+    def _goertzel_power(self):
+        s_prev = 0.0; s_prev2 = 0.0
+        for x in self.buf:
+            s = x + self._coeff * s_prev - s_prev2
+            s_prev2 = s_prev; s_prev = s
+        return (s_prev2**2 + s_prev**2 - self._coeff * s_prev * s_prev2)
+    def present(self) -> bool:
+        if len(self.buf) < self.N // 2:
+            return False
+        tone = self._goertzel_power()
+        wb = sum(x*x for x in self.buf) + 1e-9
+        ratio_db = 10.0 * math.log10(tone / (wb / len(self.buf)))
+        return ratio_db >= self._ratio_db
+
+class DCSDetector:
+    """DTCS presence + optional code/polarity verification (requires dcs_map.json).
+    Presence: heuristic using energy at ~134.4Hz and ~268.8Hz.
+    Verify: correlate learned signature frames against active audio.
+    """
+    def __init__(self, sample_rate: int = 48000, window_ms: int = 300,
+                 power_ratio_db: float = 10.0, verify=False, code=None, polarity=''):
+        self.fs = int(sample_rate)
+        self.N = int(self.fs * (window_ms / 1000.0))
+        self.buf = deque(maxlen=self.N)
+        self.verify = bool(verify)
+        self.code = None if code is None else int(code)
+        self.polarity = str(polarity or '')
+        # Presence components
+        def coeff_for(f):
+            k = int(0.5 + (self.N * f / self.fs))
+            omega = (2.0 * math.pi * k) / self.N
+            return 2.0 * math.cos(omega)
+        self.c1 = coeff_for(134.4)
+        self.c2 = coeff_for(268.8)
+        self._ratio_db = float(power_ratio_db)
+        # Verification signature (if available)
+        self.sig = None
+        if self.verify and self.code is not None:
+            key = f"{self.code}:{self.polarity or 'NN'}"
+            sig = DTCS_MAP.get(key)
+            if isinstance(sig, list) and len(sig) > 0:
+                self.sig = [float(x) for x in sig]
+    def add_frame(self, stereo_s16le: bytes):
+        import struct
+        for L, R in struct.iter_unpack('<hh', stereo_s16le):
+            self.buf.append(0.5 * (L + R))
+    def _power(self, coeff):
+        s_prev = 0.0; s_prev2 = 0.0
+        for x in self.buf:
+            s = x + coeff * s_prev - s_prev2
+            s_prev2 = s_prev; s_prev = s
+        return (s_prev2**2 + s_prev**2 - coeff * s_prev * s_prev2)
+    def _present(self) -> bool:
+        if len(self.buf) < self.N // 2:
+            return False
+        p1 = self._power(self.c1)
+        p2 = self._power(self.c2)
+        wb = sum(x*x for x in self.buf) + 1e-9
+        ratio_db = 10.0 * math.log10(((p1 + p2) / 2.0) / (wb / len(self.buf)))
+        return ratio_db >= self._ratio_db
+    def _verify(self) -> bool:
+        if not self.sig or len(self.buf) < len(self.sig):
+            return False
+        # Simple normalized cross-correlation
+        import numpy as np
+        x = np.array(self.sig, dtype=float)
+        y = np.array(list(self.buf)[-len(self.sig):], dtype=float)
+        x = (x - x.mean()) / (x.std() + 1e-9)
+        y = (y - y.mean()) / (y.std() + 1e-9)
+        corr = float(np.dot(x, y) / (len(x)))
+        # Threshold for match (tunable); expose via env DTCS_VERIFY_THRESH
+        thr = float(os.getenv('DTCS_VERIFY_THRESH', '0.35'))
+        return corr >= thr
+    def present(self) -> bool:
+        if not self._present():
+            return False
+        if self.verify and self.sig is not None:
+            return self._verify()
+        return True
+
+current_channel_meta = None
+
+class NOAAStreamSource(discord.AudioSource):
+    def __init__(self, freq_hz: int, settings: SDRSettings):
+        self.base_freq_hz = freq_hz
+        self.settings = settings
+        self.rf_proc = None
+        self.ff_proc = None
+        self.ctcss = None
+        self.ctcss_notch = False
+        self.dcs = None
+        mode = None
+        if isinstance(current_channel_meta, dict):
+            mode = str(current_channel_meta.get('type') or '').lower()
+            # Choose detector based on meta
+            ct = current_channel_meta.get('ctcss_hz')
+            if ct is not None and mode in ('tone', 'tsql', 'cross'):
+                self.ctcss = CTCSSDetector(ct)
+                self.ctcss_notch = bool(current_channel_meta.get('ctcss_notch', False))
+            # DTCS presence or verify
+            if mode == 'dtcs' or (mode == 'cross' and current_channel_meta.get('rx_dtcs_code') is not None):
+                verify = bool(current_channel_meta.get('dtcs_verify', False))
+                code = current_channel_meta.get('dtcs_code') or current_channel_meta.get('rx_dtcs_code')
+                pol  = current_channel_meta.get('dtcs_polarity') or current_channel_meta.get('rx_dtcs_polarity')
+                self.dcs = DCSDetector(verify=verify, code=code, polarity=pol)
+        self._start_pipeline()
+    @property
+    def freq_hz(self) -> int:
+        return self.base_freq_hz + int(self.settings.center_offset_hz or 0)
+    def _start_pipeline(self):
+        rf_cmd = [
+            RTL_FM_EXE, '-f', str(self.freq_hz), '-M', 'fm',
+            '-s', str(self.settings.samplerate),
+            '-g', str(self.settings.gain_db),
+            '-l', str(self.settings.squelch),
+            '-o', str(self.settings.oversampling),
+            '-A', self.settings.atan_mode,
+        ]
+        if self.settings.deemp: rf_cmd += ['-E', 'deemp']
+        if self.settings.offset_tuning: rf_cmd += ['-E', 'offset']
+        if self.settings.dc_block: rf_cmd += ['-E', 'dc']
+        if self.settings.fir_size in (0, 9): rf_cmd += ['-F', str(self.settings.fir_size)]
+        if self.settings.ppm: rf_cmd += ['-p', str(self.settings.ppm)]
+        if RTL_DEVICE_INDEX not in (None, ''): rf_cmd += ['-d', str(RTL_DEVICE_INDEX)]
+        rf_cmd += ['-']
+        # Lower HP if tone/dcs gating
+        stereo_pan = 'pan=stereo;c0=c0;c1=c0'
+        hp_cut = 35 if (self.ctcss or self.dcs) else 300
+        clean_chain = f'highpass=f={hp_cut},lowpass=f=4000,afftdn=nr=15:nf=-30:tn=1'
+        af_chain = f'{stereo_pan},{clean_chain}'
+        if self.ctcss and self.ctcss_notch:
+            af_chain = f"{af_chain},anequalizer=f={self.ctcss.target_hz}:t=o:w=1"
+        ff_cmd = [
+            FFMPEG_EXE, '-hide_banner', '-loglevel', 'warning',
+            '-f', 's16le', '-ar', str(self.settings.samplerate), '-ac', '1', '-i', 'pipe:0',
+            '-af', af_chain,
+            '-ac', '2', '-ar', '48000', '-f', 's16le', 'pipe:1'
+        ]
+        self.rf_proc = subprocess.Popen(
+            rf_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW
+        )
+        self.ff_proc = subprocess.Popen(
+            ff_cmd, stdin=self.rf_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW
+        )
+    def _frame_len_bytes(self) -> int:
+        return SAMPLES_PER_20MS * 2 * 2
+    def read(self):
+        try:
+            need = self._frame_len_bytes()
+            data = self.ff_proc.stdout.read(need)
+            if not data or len(data) < need:
+                return b''
+            # Tone/DCS gating
+            if self.ctcss:
+                self.ctcss.add_frame(data)
+                if not self.ctcss.present():
+                    return b'\x00' * need
+            elif self.dcs:
+                self.dcs.add_frame(data)
+                if not self.dcs.present():
+                    return b'\x00' * need
+            return data
+        except Exception:
+            return b''
+    def cleanup(self):
+        for p in (self.ff_proc, self.rf_proc):
+            if p and p.poll() is None:
+                try: p.terminate()
+                except Exception: pass
+    def is_opus(self):
+        return False
+
+# ------------------ Bot ------------------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.voice_states = True
+bot = commands.Bot(command_prefix=CFG.get('prefix', '!'), intents=intents)
+bot.remove_command('help')
+voice_client = None
+current_source = None
+current_freq_hz = None
+
+async def connect_voice(channel_id: int | None, ctx: commands.Context | None = None):
+    global voice_client
+    chan_obj = None
+    if channel_id:
+        chan = await bot.fetch_channel(channel_id)
+        if isinstance(chan, discord.VoiceChannel): chan_obj = chan
+        else: raise RuntimeError('VOICE_CHANNEL_ID is not a voice channel')
+    elif ctx and getattr(ctx.author, 'voice', None) and ctx.author.voice and ctx.author.voice.channel:
+        chan_obj = ctx.author.voice.channel
+    else:
+        raise RuntimeError('No voice channel provided and author not in a voice channel.')
+    if voice_client and voice_client.is_connected():
+        await voice_client.move_to(chan_obj)
+    else:
+        voice_client = await chan_obj.connect()
+
+async def _restart_pipeline():
+    global voice_client, current_source, current_freq_hz
+    if not voice_client or not voice_client.is_connected(): raise RuntimeError('Not connected to a voice channel')
+    if current_freq_hz is None: raise RuntimeError('No frequency set; use tune command')
+    if voice_client.is_playing(): voice_client.stop()
+    if current_source: current_source.cleanup()
+    current_source = NOAAStreamSource(freq_hz=current_freq_hz, settings=SETTINGS)
+    voice_client.play(current_source, after=lambda e: print(f'[ERROR] Player: {e}') if e else None)
+
+async def play_noaa(freq_hz: int):
+    global current_freq_hz
+    current_freq_hz = freq_hz
+    await _restart_pipeline()
+
+@bot.tree.command(name='chan_tune', description='Tune by channel name or MHz')
+@app_commands.describe(name='channel name', mhz='frequency in MHz')
+async def chan_tune(interaction: discord.Interaction, name: str = None, mhz: float = None):
+    global current_channel_meta
+    try:
+        if name:
+            if name not in CHANNELS:
+                await interaction.response.send_message(f"Unknown channel '{name}'.", ephemeral=True)
+                return
+            current_channel_meta = CHANNEL_META.get(name, {})
+            await play_noaa(CHANNELS[name])
+            await interaction.response.send_message(f"Tuned to {name} ({CHANNELS[name]/1e6:.6f} MHz)")
+        elif mhz is not None:
+            current_channel_meta = None
+            await play_noaa(int(mhz*1e6))
+            await interaction.response.send_message(f"Tuned to {mhz:.6f} MHz")
+        else:
+            await interaction.response.send_message('Provide a channel name or MHz.', ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f'Error: {e}', ephemeral=True)
+
+@bot.tree.command(name='chan_list', description='List channels')
+async def chan_list(interaction: discord.Interaction):
+    if not CHANNELS:
+        await interaction.response.send_message('No channels loaded.', ephemeral=True)
+        return
+    lines = [f"- {k}: {v/1e6:.6f} MHz" for k, v in sorted(CHANNELS.items())]
+    await interaction.response.send_message('\n'.join(lines), ephemeral=True)
+
+@bot.tree.command(name='chan_reload', description='Reload channels.json')
+async def chan_reload(interaction: discord.Interaction):
+    global CHANNELS
+    CHANNELS = load_channels(CHANNELS_JSON)
+    await interaction.response.send_message(f'Reloaded {len(CHANNELS)} channels.', ephemeral=True)
+
+@bot.command(name='chan_tune')
+async def chan_tune_cmd(ctx: commands.Context, *, arg: str):
+    global current_channel_meta
+    try:
+        if arg in CHANNELS:
+            current_channel_meta = CHANNEL_META.get(arg, {})
+            await play_noaa(CHANNELS[arg])
+            await ctx.reply(f'Tuned to {arg} ({CHANNELS[arg]/1e6:.6f} MHz)'); return
+        try:
+            mhz = float(arg)
+            current_channel_meta = None
+            await play_noaa(int(mhz * 1e6))
+            await ctx.reply(f'Tuned to {mhz:.6f} MHz'); return
+        except Exception:
+            await ctx.reply(f'Unknown channel or invalid MHz: {arg}.')
+    except Exception as e:
+        await ctx.reply(f'chan_tune error: {e}')
+
+# ------------------ Entrypoint ------------------
+def main():
+    token = CFG.get('token')
+    if not token:
+        print('[ERROR] No token found. Set DISCORD_CFG or DISCORD_TOKEN.')
+        sys.exit(1)
+    def _sigterm(*_): asyncio.get_event_loop().create_task(_shutdown())
+    async def _shutdown():
+        try: await bot.close()
+        except Exception: pass
+    signal.signal(signal.SIGTERM, _sigterm)
+    bot.run(token)
+
+if __name__ == '__main__':
+    main()
